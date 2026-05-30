@@ -66,7 +66,10 @@ python3 -m http.server 8000
 | 01 AI 小白入门 | 02 AI 工具与大模型 | 03 AI 编程与智能体 |
 | 04 AI 内容创作 | 05 AI 效率提升 | 06 AI 行业观察 |
 
-资料全部公开免费，每周更新。更多开源项目 👉 **[github.com/aisparkedu](https://github.com/aisparkedu)**
+资料全部公开免费，每周更新。
+
+- 📖 **飞书知识库**：<https://lcnniolukk80.feishu.cn/wiki/U1ukwWrOei3FpUkQhAjclLOInug>
+- 💻 **开源项目**：[github.com/aisparkedu](https://github.com/aisparkedu)
 
 <div align="center">
 <sub>Made with 💧 by AI Spark · 一线 AI 实战者的开源知识社区</sub>
