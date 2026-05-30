@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<!--
+  交互艺术网页：水波 (Liquid Water Ripple) —— 按原作者提示词实现 [Claude 版]
+
+  效果：摄像头作为背景，WebGL shader 实时叠加水波纹物理。手指划过处产生涟漪并向外扩散；
+        手停下就不再注入、余波自然消退。
+
+  实现（对照原作者提示词）：
+    · FBO ping-pong 双缓冲跑波动方程，9-tap 各向同性拉普拉斯（减方形伪影）
+    · 非线性衰减：小振幅衰减快(表面张力)、大振幅衰减慢(惯性)
+    · 手指交互用宽高比校正的 capsule SDF（线段），注入强度随手速 → 划过才起波
+    · 渲染：grad 不归一化折射 / Laplacian 透镜 / RGB 色散 / Schlick Fresnel /
+            波深明暗(峰暖谷冷) / 双瓣高光(sharp specular + broad sheen)
+    · MediaPipe Hands 取 10 个指尖；前摄像头自动镜像
+
+  注：用 WebGL2（桌面验证）。WebGL1 兼容、LIQUID/CRYSTAL 双模式、前后摄切换为后续项。
+
+  【运行】cd 本目录 && python3 -m http.server 8000 → http://localhost:8000/index.html
+  【方向反了】改 CONFIG.mirror（0/1）。
+-->
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>水波 · Liquid Ripple [Claude]</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <style>
+    :root {
+      --bg: #04060d; --panel-bg: rgba(10,16,32,.72); --border: rgba(255,255,255,.08);
+      --accent: #4ea8ff; --accent-glow: rgba(78,168,255,.45); --text: #eef4ff; --text-dim: #8a98b5;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100vw; height: 100vh; overflow: hidden; background: var(--bg);
+      color: var(--text); user-select: none;
+      font-family: "Maple Mono NF", -apple-system, "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    #webgl-canvas { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; display: block; }
+    #webcam { display: none; }
+    .overlay {
+      position: absolute; inset: 0; z-index: 100; display: flex; justify-content: center; align-items: center;
+      background: rgba(4,6,13,.88); transition: opacity .5s ease, visibility .5s ease;
+    }
+    .overlay.hidden { opacity: 0; visibility: hidden; pointer-events: none; }
+    .card {
+      background: var(--panel-bg); border: 1px solid var(--border); border-radius: 20px;
+      padding: 2.2rem 2.4rem; max-width: 440px; width: 88%; text-align: center;
+      backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); box-shadow: 0 20px 50px rgba(0,0,0,.5);
+    }
+    .card h2 { font-size: 1.35rem; font-weight: 600; margin-bottom: .7rem; }
+    .card p { color: var(--text-dim); font-size: .92rem; line-height: 1.7; }
+    .card code { color: var(--accent); background: rgba(78,168,255,.1); padding: .1em .4em; border-radius: 5px; }
+    .spinner {
+      width: 46px; height: 46px; margin: 0 auto 1.4rem; border-radius: 50%;
+      border: 3px solid rgba(255,255,255,.12); border-top-color: var(--accent);
+      animation: spin 1s linear infinite; box-shadow: 0 0 16px var(--accent-glow);
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error-ic { font-size: 2.6rem; margin-bottom: .8rem; }
+    #hint {
+      position: absolute; top: 26px; left: 50%; transform: translateX(-50%);
+      z-index: 5; display: flex; align-items: center; gap: 9px;
+      background: rgba(12,20,38,.62); border: 1px solid var(--border);
+      padding: .55rem 1.4rem; border-radius: 50px; font-size: .88rem; color: var(--text-dim);
+      backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+      transition: opacity .5s ease, transform .5s ease;
+    }
+    #hint.hidden { opacity: 0; transform: translateX(-50%) translateY(-14px); pointer-events: none; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+      box-shadow: 0 0 8px var(--accent); animation: pulse 1.6s infinite; }
+    @keyframes pulse { 0%,100% { transform: scale(.85); opacity: .6; } 50% { transform: scale(1.2); opacity: 1; } }
+    #panel-toggle {
+      position: absolute; top: 22px; right: 22px; z-index: 20;
+      background: rgba(255,255,255,.08); border: 1px solid var(--border); color: var(--text);
+      padding: .55rem 1.1rem; border-radius: 50px; cursor: pointer; font-size: .84rem;
+      display: flex; align-items: center; gap: 6px; backdrop-filter: blur(10px); transition: all .25s ease;
+    }
+    #panel-toggle:hover { background: rgba(255,255,255,.15); transform: translateY(-1px); }
+    #panel {
+      position: absolute; top: 0; right: 0; width: 320px; height: 100%; z-index: 15;
+      background: rgba(6,10,22,.8); border-left: 1px solid var(--border);
+      backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
+      padding: 76px 1.6rem 1.6rem; overflow-y: auto;
+      transform: translateX(100%); transition: transform .45s cubic-bezier(.16,1,.3,1);
+      box-shadow: -10px 0 40px rgba(0,0,0,.5);
+    }
+    #panel.open { transform: translateX(0); }
+    .panel-section {
+      font-size: .82rem; font-weight: 600; color: var(--accent);
+      margin: 1.3rem 0 .7rem; padding-bottom: .4rem; border-bottom: 1px solid var(--border);
+    }
+    .panel-section:first-child { margin-top: 0; }
+    .ctrl { margin-bottom: 1rem; }
+    .ctrl-label { display: flex; justify-content: space-between; font-size: .8rem; color: var(--text-dim); margin-bottom: .35rem; }
+    .ctrl-val { color: var(--text); font-weight: 600; }
+    input[type=range] {
+      -webkit-appearance: none; width: 100%; height: 5px; border-radius: 3px;
+      background: rgba(255,255,255,.1); outline: none;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 15px; height: 15px; border-radius: 50%;
+      background: var(--accent); cursor: pointer; box-shadow: 0 0 8px var(--accent-glow); transition: transform .1s;
+    }
+    input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.25); }
+    .panel-foot { margin-top: 1.6rem; padding-top: 1rem; border-top: 1px solid var(--border);
+      font-size: .72rem; color: rgba(255,255,255,.28); text-align: center; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <canvas id="webgl-canvas"></canvas>
+  <video id="webcam" autoplay playsinline muted></video>
+
+  <div id="hint"><span class="dot"></span><span>把手伸到镜头前，手指划动</span></div>
+
+  <button id="panel-toggle"><span>⚙</span><span>参数调校</span></button>
+  <div id="panel"><div id="panel-body"></div>
+    <div class="panel-foot">Liquid Ripple · Claude<br>拖动滑块实时调参</div>
+  </div>
+
+  <div id="overlay-loading" class="overlay">
+    <div class="card">
+      <div class="spinner"></div>
+      <h2>正在初始化</h2>
+      <p>加载手势追踪模型并唤醒摄像头，请允许摄像头权限。首次加载需下载资源，稍候片刻…</p>
+    </div>
+  </div>
+  <div id="overlay-error" class="overlay hidden">
+    <div class="card">
+      <div class="error-ic">⚠️</div>
+      <h2>无法访问摄像头</h2>
+      <p id="error-msg"></p>
+    </div>
+  </div>
+
+  <!-- ===================== GLSL 着色器 ===================== -->
+  <script id="shaders">
+    const VERT = `
+      varying vec2 vUv;
+      void main() { vUv = uv; gl_Position = vec4(position, 1.0); }
+    `;
+
+    // --- 波动方程模拟：FBO ping-pong，9-tap 各向同性拉普拉斯，capsule SDF 注入 ---
+    // R = 当前帧高度 H(t)，G = 上一帧高度 H(t-1)
+    const SIM_FRAG = `
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D uPrev;
+      uniform vec2  uTexel;
+      uniform float uAspect;
+      uniform float uWaveSpeed;      // 波速 c²（<0.5 保稳定）
+      uniform float uDampSmall;      // 小振幅衰减（表面张力，快）
+      uniform float uDampLarge;      // 大振幅衰减（惯性，慢）
+      uniform float uAmpThresh;      // 区分大小振幅的阈值
+      uniform vec4  uPointers[10];   // 指尖 capsule：xy=上一位置, zw=当前位置
+      uniform float uPointerCount;
+      uniform float uForce;          // 注入力度
+      uniform float uRadius;         // capsule 半径
+      uniform float uMoveThresh;     // 起波位移阈值（手不动则几乎不注入）
+
+      // 点到线段距离（capsule SDF），保证手指划过是一条连续线
+      float sdSeg(vec2 p, vec2 a, vec2 b) {
+        vec2 pa = p - a, ba = b - a;
+        float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+        return length(pa - ba * h);
+      }
+
+      void main() {
+        float c  = texture2D(uPrev, vUv).r;   // H(t)
+        float op = texture2D(uPrev, vUv).g;   // H(t-1)
+
+        // 9-tap 各向同性拉普拉斯（正交权重4、对角权重1、中心-20，再 /6）
+        float L  = texture2D(uPrev, vUv + vec2(-uTexel.x, 0.0)).r;
+        float R  = texture2D(uPrev, vUv + vec2( uTexel.x, 0.0)).r;
+        float U  = texture2D(uPrev, vUv + vec2(0.0,  uTexel.y)).r;
+        float D  = texture2D(uPrev, vUv + vec2(0.0, -uTexel.y)).r;
+        float UL = texture2D(uPrev, vUv + vec2(-uTexel.x,  uTexel.y)).r;
+        float UR = texture2D(uPrev, vUv + vec2( uTexel.x,  uTexel.y)).r;
+        float DL = texture2D(uPrev, vUv + vec2(-uTexel.x, -uTexel.y)).r;
+        float DR = texture2D(uPrev, vUv + vec2( uTexel.x, -uTexel.y)).r;
+        float lap = (4.0 * (L + R + U + D) + (UL + UR + DL + DR) - 20.0 * c) / 6.0;
+
+        // 波动方程：H(t+1) = 2H(t) - H(t-1) + c²·∇²H
+        float nv = 2.0 * c - op + uWaveSpeed * lap;
+
+        // 非线性衰减：小振幅衰减快（张力），大振幅衰减慢（惯性）
+        float amp = abs(nv);
+        float damp = mix(uDampSmall, uDampLarge, smoothstep(0.0, uAmpThresh, amp));
+        nv *= damp;
+
+        // 指尖 capsule SDF 注入（宽高比校正 → 圆形波纹）
+        for (int i = 0; i < 10; i++) {
+          if (float(i) >= uPointerCount) break;
+          vec4 seg = uPointers[i];
+          vec2 p = vec2(vUv.x * uAspect, vUv.y);
+          vec2 a = vec2(seg.x * uAspect, seg.y);
+          vec2 b = vec2(seg.z * uAspect, seg.w);
+          float d = sdSeg(p, a, b);
+          // 注入强度随手指位移：手不动几乎不注入，划过才起波
+          float strength = uForce * smoothstep(0.0, uMoveThresh, length(b - a));
+          nv += strength * exp(-(d * d) / (uRadius * uRadius));
+        }
+
+        nv = clamp(nv, -3.0, 3.0);
+        gl_FragColor = vec4(nv, c, 0.0, 1.0);
+      }
+    `;
+
+    // --- 渲染：grad 折射 + Laplacian 透镜 + 色散 + Fresnel + 波深明暗 + 双瓣高光 ---
+    const RENDER_FRAG = `
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D uVideo;
+      uniform sampler2D uHeight;
+      uniform vec2  uTexel;
+      uniform vec2  uVideoScale;
+      uniform float uMirror;
+      uniform float uRefraction;     // 折射（grad 直接驱动，不归一化）
+      uniform float uLens;           // Laplacian 透镜放大
+      uniform float uChroma;         // 色散
+      uniform float uFresnelF0;      // Schlick F0
+      uniform float uDepthShade;     // 波深明暗
+      uniform float uSpecSharp;      // 锐镜面高光
+      uniform float uSpecBroad;      // 宽丝绸光泽
+      uniform float uBgBlur;         // 背景毛玻璃（默认0，作者原版无）
+      uniform float uBgDark;         // 背景压暗（无波区）
+
+      vec3 frosted(vec2 uv, float r) {
+        vec2 t[8];
+        t[0]=vec2(1,0); t[1]=vec2(-1,0); t[2]=vec2(0,1); t[3]=vec2(0,-1);
+        t[4]=vec2(.7,.7); t[5]=vec2(-.7,.7); t[6]=vec2(.7,-.7); t[7]=vec2(-.7,-.7);
+        vec3 s = texture2D(uVideo, uv).rgb;
+        for (int i = 0; i < 8; i++) s += texture2D(uVideo, uv + t[i] * r).rgb;
+        return s / 9.0;
+      }
+
+      void main() {
+        float h = texture2D(uHeight, vUv).r;
+        float L = texture2D(uHeight, vUv + vec2(-uTexel.x, 0.0)).r;
+        float R = texture2D(uHeight, vUv + vec2( uTexel.x, 0.0)).r;
+        float U = texture2D(uHeight, vUv + vec2(0.0,  uTexel.y)).r;
+        float D = texture2D(uHeight, vUv + vec2(0.0, -uTexel.y)).r;
+        vec2 grad = vec2(R - L, U - D);          // 不归一化
+        float lap = (L + R + U + D - 4.0 * h);   // 曲率（透镜用）
+
+        // 摄像头 UV：cover 裁剪 + 镜像（branch-free）
+        vec2 vid = (vUv - 0.5) * uVideoScale + 0.5;
+        vid.x = mix(vid.x, 1.0 - vid.x, uMirror);
+
+        // 折射偏移：坡度直接驱动（坡越陡偏移越大）+ Laplacian 透镜（波峰放大）
+        vec2 off = grad * uRefraction + grad * lap * uLens;
+
+        // 色散：RGB 三通道偏移略有差异
+        vec3 col;
+        col.r = texture2D(uVideo, vid + off * (1.0 + uChroma)).r;
+        col.g = texture2D(uVideo, vid + off).g;
+        col.b = texture2D(uVideo, vid + off * (1.0 - uChroma)).b;
+
+        // 只有有波处才叠加光照（静止画面保持清晰）
+        float activity = smoothstep(0.0, 0.02, abs(h) + length(grad) * 3.0);
+
+        // 法线 & Schlick Fresnel（掠射角反光更强）
+        vec3 n = normalize(vec3(-grad * 4.0, 1.0));
+        float cosT = max(n.z, 0.0);
+        float fres = uFresnelF0 + (1.0 - uFresnelF0) * pow(1.0 - cosT, 5.0);
+
+        // 双瓣高光：sharp specular + broad sheen
+        vec3 lightDir = normalize(vec3(0.4, 0.7, 1.0));
+        vec3 halfDir = normalize(lightDir + vec3(0.0, 0.0, 1.0));
+        float nh = max(dot(n, halfDir), 0.0);
+        float specSharp = pow(nh, 90.0) * uSpecSharp;
+        float sheen = pow(nh, 5.0) * uSpecBroad;
+
+        // 波深明暗：波峰偏暖亮，波谷偏冷暗
+        vec3 warm = vec3(1.0, 0.92, 0.78);
+        vec3 cool = vec3(0.45, 0.65, 1.0);
+        col += uDepthShade * (max(h, 0.0) * warm - max(-h, 0.0) * cool) * activity;
+
+        // 高光 + Fresnel
+        col += (specSharp + sheen + fres * 0.25) * vec3(1.0, 0.98, 0.95) * activity;
+
+        // 背景毛玻璃（可选，默认0；为0时跳过 9 次采样省性能）
+        if (uBgBlur > 0.001) {
+          vec3 fr = frosted(vid, uBgBlur);
+          col = mix(fr, col, activity);
+        }
+
+        // 背景压暗：无波区调暗，水波区保持 → 背景沉下来、水波更突出
+        col *= mix(uBgDark, 1.0, activity);
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+  </script>
+
+  <!-- ===================== 主程序 ===================== -->
+  <script id="main">
+    // ---------- 1. 配置 ----------
+    const CONFIG = {
+      // 波动物理
+      waveSpeed: 0.31,          // 波速 c²（<0.5 稳定）
+      radius: 0.031,            // capsule 半径（波源粗细）
+      force: 0.06,              // 注入力度
+      dampSmall: 0.870,         // 小振幅衰减（张力，快）
+      dampLarge: 0.925,         // 大振幅衰减（划过后约 1 秒内消失）
+      ampThresh: 0.12,          // 大小振幅阈值
+      moveThresh: 0.006,        // 起波位移阈值（手不动不注入）
+      simResolution: 256,
+      // 渲染
+      refraction: 0.12,         // 折射（grad 驱动）
+      lens: 0.25,               // Laplacian 透镜
+      chroma: 0.30,             // 色散
+      fresnelF0: 0.04,          // Schlick Fresnel
+      depthShade: 0.30,         // 波深明暗
+      specSharp: 1.50,          // 锐高光
+      specBroad: 0.40,          // 丝绸光泽
+      bgBlur: 0.005,            // 背景毛玻璃
+      bgDark: 0.85,             // 背景压暗（无波区，越小越暗）
+      mirror: 1,                // 前摄像头镜像
+    };
+
+    const PARAMS = [
+      { group: '💧 波动物理' },
+      { key: 'waveSpeed',  label: '波速',     min: 0.05, max: 0.49, step: 0.01,  fmt: 2 },
+      { key: 'force',      label: '注入力度', min: 0.01, max: 0.20, step: 0.005, fmt: 3 },
+      { key: 'radius',     label: '波源粗细', min: 0.005,max: 0.05, step: 0.002, fmt: 3 },
+      { key: 'dampLarge',  label: '余波持久', min: 0.82, max: 0.99, step: 0.005, fmt: 3 },
+      { group: '✨ 渲染' },
+      { key: 'refraction', label: '折射强度', min: 0.0,  max: 0.30, step: 0.01,  fmt: 2 },
+      { key: 'lens',       label: '透镜放大', min: 0.0,  max: 1.0,  step: 0.05,  fmt: 2 },
+      { key: 'chroma',     label: '色散',     min: 0.0,  max: 0.8,  step: 0.05,  fmt: 2 },
+      { key: 'depthShade', label: '波深明暗', min: 0.0,  max: 1.0,  step: 0.05,  fmt: 2 },
+      { key: 'specSharp',  label: '锐高光',   min: 0.0,  max: 3.0,  step: 0.1,   fmt: 1 },
+      { key: 'bgBlur',     label: '背景毛玻璃', min: 0.0, max: 0.02, step: 0.001, fmt: 3 },
+      { key: 'bgDark',     label: '背景明暗', min: 0.2, max: 1.0, step: 0.05, fmt: 2 },
+    ];
+
+    // ---------- 2. Three.js / WebGL ----------
+    let renderer, simScene, simCam, mainScene, mainCam;
+    let rtRead, rtWrite, simMat, mainMat, video, videoTexture;
+    const MAX_POINTS = 10;
+    const pointers = new Float32Array(MAX_POINTS * 4); // capsule: prevX, prevY, currX, currY
+
+    function initWebGL() {
+      const canvas = document.getElementById('webgl-canvas');
+      const gl = canvas.getContext('webgl2');
+      if (!gl) { showError('您的设备不支持 WebGL2。'); return false; }
+
+      renderer = new THREE.WebGLRenderer({
+        canvas, context: gl, antialias: false, depth: false, stencil: false,
+        powerPreference: 'high-performance',
+      });
+      renderer.setPixelRatio(1); // 性能：限制 1x（Retina 屏可省一半以上像素）
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      const res = CONFIG.simResolution;
+      const opts = {
+        type: THREE.HalfFloatType, format: THREE.RGBAFormat,
+        minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+        wrapS: THREE.ClampToEdgeWrapping, wrapT: THREE.ClampToEdgeWrapping,
+        depthBuffer: false, stencilBuffer: false,
+      };
+      rtRead = new THREE.WebGLRenderTarget(res, res, opts);
+      rtWrite = rtRead.clone();
+      clearRT(rtRead); clearRT(rtWrite);
+
+      const quad = new THREE.PlaneGeometry(2, 2);
+      simCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      mainCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+      simMat = new THREE.ShaderMaterial({
+        vertexShader: VERT, fragmentShader: SIM_FRAG, depthTest: false, depthWrite: false,
+        uniforms: {
+          uPrev: { value: null },
+          uTexel: { value: new THREE.Vector2(1 / res, 1 / res) },
+          uAspect: { value: window.innerWidth / window.innerHeight },
+          uWaveSpeed: { value: CONFIG.waveSpeed },
+          uDampSmall: { value: CONFIG.dampSmall },
+          uDampLarge: { value: CONFIG.dampLarge },
+          uAmpThresh: { value: CONFIG.ampThresh },
+          uPointers: { value: pointers },
+          uPointerCount: { value: 0 },
+          uForce: { value: CONFIG.force },
+          uRadius: { value: CONFIG.radius },
+          uMoveThresh: { value: CONFIG.moveThresh },
+        },
+      });
+      simScene = new THREE.Scene();
+      simScene.add(new THREE.Mesh(quad, simMat));
+
+      video = document.getElementById('webcam');
+      videoTexture = new THREE.VideoTexture(video);
+      videoTexture.minFilter = THREE.LinearFilter;
+      videoTexture.magFilter = THREE.LinearFilter;
+
+      mainMat = new THREE.ShaderMaterial({
+        vertexShader: VERT, fragmentShader: RENDER_FRAG, depthTest: false, depthWrite: false,
+        uniforms: {
+          uVideo: { value: videoTexture },
+          uHeight: { value: null },
+          uTexel: { value: new THREE.Vector2(1 / res, 1 / res) },
+          uVideoScale: { value: new THREE.Vector2(1, 1) },
+          uMirror: { value: CONFIG.mirror },
+          uRefraction: { value: CONFIG.refraction },
+          uLens: { value: CONFIG.lens },
+          uChroma: { value: CONFIG.chroma },
+          uFresnelF0: { value: CONFIG.fresnelF0 },
+          uDepthShade: { value: CONFIG.depthShade },
+          uSpecSharp: { value: CONFIG.specSharp },
+          uSpecBroad: { value: CONFIG.specBroad },
+          uBgBlur: { value: CONFIG.bgBlur },
+          uBgDark: { value: CONFIG.bgDark },
+        },
+      });
+      mainScene = new THREE.Scene();
+      mainScene.add(new THREE.Mesh(quad, mainMat));
+
+      window.addEventListener('resize', onResize);
+      return true;
+    }
+
+    function clearRT(rt) {
+      renderer.setRenderTarget(rt);
+      renderer.setClearColor(0x000000, 1);
+      renderer.clear();
+      renderer.setRenderTarget(null);
+    }
+
+    function syncUniforms() {
+      if (!simMat) return;
+      simMat.uniforms.uWaveSpeed.value = CONFIG.waveSpeed;
+      simMat.uniforms.uForce.value = CONFIG.force;
+      simMat.uniforms.uRadius.value = CONFIG.radius;
+      simMat.uniforms.uDampLarge.value = CONFIG.dampLarge;
+      mainMat.uniforms.uRefraction.value = CONFIG.refraction;
+      mainMat.uniforms.uLens.value = CONFIG.lens;
+      mainMat.uniforms.uChroma.value = CONFIG.chroma;
+      mainMat.uniforms.uDepthShade.value = CONFIG.depthShade;
+      mainMat.uniforms.uSpecSharp.value = CONFIG.specSharp;
+      mainMat.uniforms.uBgBlur.value = CONFIG.bgBlur;
+      mainMat.uniforms.uBgDark.value = CONFIG.bgDark;
+    }
+
+    function onResize() {
+      if (!renderer) return;
+      const w = window.innerWidth, h = window.innerHeight;
+      renderer.setSize(w, h);
+      simMat.uniforms.uAspect.value = w / h;
+      updateVideoScale();
+    }
+
+    function updateVideoScale() {
+      if (!video || !video.videoWidth) return;
+      const va = video.videoWidth / video.videoHeight;
+      const sa = window.innerWidth / window.innerHeight;
+      if (sa > va) mainMat.uniforms.uVideoScale.value.set(1, va / sa);
+      else mainMat.uniforms.uVideoScale.value.set(sa / va, 1);
+    }
+
+    // ---------- 3. 手势追踪：10 个指尖 ----------
+    const TIPS = [4, 8, 12, 16, 20]; // 拇/食/中/无名/小 指尖
+    const tracked = {
+      Left:  TIPS.map(() => ({ x: .5, y: .5, px: .5, py: .5, active: false })),
+      Right: TIPS.map(() => ({ x: .5, y: .5, px: .5, py: .5, active: false })),
+    };
+    let hands, modelReady = false, sending = false;
+
+    function initHands() {
+      hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${f}` });
+      hands.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+      hands.onResults(onHandResults);
+    }
+
+    function onHandResults(res) {
+      if (!modelReady) {
+        modelReady = true;
+        document.getElementById('overlay-loading').classList.add('hidden');
+      }
+      const seen = { Left: false, Right: false };
+      const scale = mainMat.uniforms.uVideoScale.value;
+
+      if (res.multiHandLandmarks && res.multiHandLandmarks.length) {
+        document.getElementById('hint').classList.add('hidden');
+        res.multiHandLandmarks.forEach((lm, i) => {
+          const label = res.multiHandedness[i].label;
+          seen[label] = true;
+          TIPS.forEach((idx, k) => {
+            const p = lm[idx];
+            const hx = CONFIG.mirror > 0.5 ? (0.5 - p.x) / scale.x + 0.5 : (p.x - 0.5) / scale.x + 0.5;
+            const hy = (0.5 - p.y) / scale.y + 0.5;
+            const j = tracked[label][k];
+            if (j.active) {
+              j.x = j.x * 0.4 + hx * 0.6; // 滤波降抖
+              j.y = j.y * 0.4 + hy * 0.6;
+            } else {
+              j.x = hx; j.y = hy; j.px = hx; j.py = hy; j.active = true;
+            }
+          });
+        });
+      } else {
+        document.getElementById('hint').classList.remove('hidden');
+      }
+      ['Left', 'Right'].forEach(label => {
+        if (!seen[label]) tracked[label].forEach(j => { j.active = false; });
+      });
+    }
+
+    // 构造每个指尖的 capsule（上一注入点 → 当前点）
+    function buildPointers() {
+      let count = 0;
+      for (const label of ['Left', 'Right']) {
+        for (const j of tracked[label]) {
+          if (j.active && count < MAX_POINTS) {
+            const k = count * 4;
+            pointers[k] = j.px; pointers[k + 1] = j.py;   // 线段起点（上一帧位置）
+            pointers[k + 2] = j.x; pointers[k + 3] = j.y;  // 线段终点（当前位置）
+            j.px = j.x; j.py = j.y;                         // 推进
+            count++;
+          }
+        }
+      }
+      return count;
+    }
+
+    // ---------- 4. 摄像头 ----------
+    async function initCamera() {
+      try {
+        if (!navigator.mediaDevices?.getUserMedia)
+          throw new Error('浏览器不支持 getUserMedia，或当前非 localhost / HTTPS 安全环境。');
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false,
+        });
+        video.srcObject = stream;
+        await new Promise(r => { video.onloadedmetadata = () => video.play().then(r); });
+        updateVideoScale();
+        loopHands();
+      } catch (e) {
+        console.error(e);
+        showError(`无法唤起摄像头：${e.message}<br><br>` +
+          `1. 若误拒授权，点地址栏左侧锁图标重新允许。<br>` +
+          `2. 不能用 file:// 打开，须起本地服务器：<br>` +
+          `&nbsp;&nbsp;<code>python3 -m http.server 8000</code> → <code>http://localhost:8000/index.html</code>`);
+      }
+    }
+
+    let lastSendTime = 0;
+    const DETECT_INTERVAL = 66; // 手势检测节流 ~15fps（手移动不快，足够；大幅降 ML 推理频率=降发热）
+    function loopHands() {
+      const tick = async () => {
+        const now = performance.now();
+        if (video.readyState >= 2 && !video.paused && !sending && now - lastSendTime >= DETECT_INTERVAL) {
+          lastSendTime = now;
+          sending = true;
+          try { await hands.send({ image: video }); }
+          catch (e) { console.error('hands.send', e); }
+          finally { sending = false; }
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }
+
+    // ---------- 5. 渲染循环 ----------
+    function render() {
+      requestAnimationFrame(render);
+      if (!renderer) return;
+
+      const count = buildPointers();
+
+      // (1) 波动方程 → rtWrite
+      simMat.uniforms.uPrev.value = rtRead.texture;
+      simMat.uniforms.uPointerCount.value = count;
+      simMat.uniforms.uPointers.needsUpdate = true;
+      renderer.setRenderTarget(rtWrite);
+      renderer.render(simScene, simCam);
+      renderer.setRenderTarget(null);
+
+      // (2) ping-pong 交换
+      const tmp = rtRead; rtRead = rtWrite; rtWrite = tmp;
+
+      // (3) 折射渲染 → 屏幕
+      mainMat.uniforms.uHeight.value = rtRead.texture;
+      renderer.render(mainScene, mainCam);
+    }
+
+    // ---------- 6. UI / 启动 ----------
+    function buildPanel() {
+      const body = document.getElementById('panel-body');
+      const toggle = document.getElementById('panel-toggle');
+      const panel = document.getElementById('panel');
+      toggle.addEventListener('click', e => { e.stopPropagation(); panel.classList.toggle('open'); });
+      document.body.addEventListener('click', () => panel.classList.remove('open'));
+      panel.addEventListener('click', e => e.stopPropagation());
+
+      PARAMS.forEach(p => {
+        if (p.group) {
+          const h = document.createElement('div');
+          h.className = 'panel-section'; h.textContent = p.group; body.appendChild(h); return;
+        }
+        const wrap = document.createElement('div'); wrap.className = 'ctrl';
+        const lab = document.createElement('div'); lab.className = 'ctrl-label';
+        const name = document.createElement('span'); name.textContent = p.label;
+        const val = document.createElement('span'); val.className = 'ctrl-val';
+        val.textContent = Number(CONFIG[p.key]).toFixed(p.fmt);
+        lab.append(name, val);
+        const input = document.createElement('input');
+        input.type = 'range'; input.min = p.min; input.max = p.max; input.step = p.step; input.value = CONFIG[p.key];
+        input.addEventListener('input', () => {
+          CONFIG[p.key] = parseFloat(input.value);
+          val.textContent = parseFloat(input.value).toFixed(p.fmt);
+          syncUniforms();
+        });
+        wrap.append(lab, input); body.appendChild(wrap);
+      });
+    }
+
+    function showError(msg) {
+      document.getElementById('overlay-loading').classList.add('hidden');
+      document.getElementById('error-msg').innerHTML = msg;
+      document.getElementById('overlay-error').classList.remove('hidden');
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      buildPanel();
+      if (!initWebGL()) return;
+      initHands();
+      initCamera();
+      render();
+    });
+  </script>
+</body>
+</html>
